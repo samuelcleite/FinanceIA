@@ -12,8 +12,6 @@ Hospedagem recomendada: Railway, Render ou Fly.io (free tier suficiente).
 """
 
 import os
-from dotenv import load_dotenv
-load_dotenv()
 import json
 import logging
 from typing import Optional
@@ -109,9 +107,13 @@ class BuscaRequest(BaseModel):
     """Payload enviado pelo Base44."""
 
     pergunta: str = Field(..., description="Pergunta do usuário sobre fundos")
+    plataformas: Optional[list[str]] = Field(
+        None,
+        description="Filtrar por plataformas (ex: ['XP', 'BTG']). Aceita múltiplas.",
+    )
     plataforma: Optional[str] = Field(
         None,
-        description="Filtrar por plataforma (ex: 'XP', 'BTG', 'Inter')",
+        description="Filtrar por plataforma única (retrocompatível). Use 'plataformas' para múltiplas.",
     )
     categoria: Optional[str] = Field(
         None,
@@ -180,6 +182,50 @@ def gerar_embedding(texto: str) -> list[float]:
         dimensions=EMBEDDING_DIMENSIONS,
     )
     return response.data[0].embedding
+
+
+def expandir_query(pergunta: str) -> str:
+    """
+    Reescreve a pergunta do usuário para incluir termos técnicos
+    que existem nos documentos dos fundos, melhorando o retrieval.
+
+    Ex: "isento de IR" → inclui "debêntures incentivadas infraestrutura tributação isento"
+    """
+    EXPANSION_PROMPT = """Você é um assistente que reescreve perguntas de clientes sobre investimentos
+para melhorar a busca semântica em um banco de dados de fundos de investimento.
+
+O banco contém fundos com campos como: nome, gestor, categoria, subcategoria, tipo_produto,
+indexador, benchmark, tributacao, come_cotas, quando_indicar, quando_nao_indicar,
+vantagens, desvantagens, alertas, descricao_tecnica.
+
+Reescreva a pergunta adicionando sinônimos técnicos e termos relacionados que provavelmente
+aparecem nos documentos dos fundos. Mantenha a pergunta original e adicione os termos extras.
+
+IMPORTANTE: retorne APENAS a query expandida, sem explicação.
+
+Exemplos:
+- "isento de IR" → "renda fixa isento IR isenção imposto de renda debêntures incentivadas infraestrutura lei 12431 tributação isento pessoa física"
+- "fundo conservador" → "fundo conservador baixo risco renda fixa CDI pós-fixado liquidez diária volatilidade baixa"
+- "proteção contra inflação" → "proteção inflação IPCA indexado inflação NTN-B tesouro IPCA+ hedge inflacionário"
+- "fundo para aposentadoria" → "fundo aposentadoria previdência longo prazo PGBL VGBL previdenciário"
+"""
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": f"Pergunta do cliente: {pergunta}"}],
+            system=EXPANSION_PROMPT,
+        )
+        expanded = response.content[0].text.strip()
+        logger.info(f"   Query expandida: {expanded[:100]}...")
+        return expanded
+    except Exception as e:
+        logger.warning(f"   Query expansion falhou ({e}), usando query original")
+        return pergunta
 
 
 def buscar_fundos_supabase(
@@ -429,11 +475,14 @@ async def buscar_fundos(
     3. Formata cada fundo como contexto legível
     4. Retorna contexto consolidado pronto para prompt
     """
-    logger.info(f"🔍 Busca: '{request.pergunta}' | plataforma={request.plataforma} | categoria={request.categoria}")
+    logger.info(f"🔍 Busca: '{request.pergunta}' | plataforma={request.plataforma} | plataformas={request.plataformas} | categoria={request.categoria}")
 
     try:
-        # 1. Gerar embedding da pergunta
-        embedding = gerar_embedding(request.pergunta)
+        # 1. Expandir a query para melhorar o retrieval
+        query_expandida = expandir_query(request.pergunta)
+
+        # 2. Gerar embedding da query expandida
+        embedding = gerar_embedding(query_expandida)
         logger.info(f"   Embedding gerado ({len(embedding)} dimensões)")
 
     except Exception as e:
@@ -441,14 +490,30 @@ async def buscar_fundos(
         raise HTTPException(status_code=502, detail=f"Erro ao gerar embedding: {str(e)}")
 
     try:
-        # 2. Buscar fundos no Supabase
-        resultados = buscar_fundos_supabase(
-            query_embedding=embedding,
-            plataforma=request.plataforma,
-            categoria=request.categoria,
-            tipo_produto=request.tipo_produto,
-            top_k=request.top_k,
-        )
+        # 3. Buscar fundos — se múltiplas plataformas, faz uma busca por plataforma e merge
+        plataformas_lista = request.plataformas or ([request.plataforma] if request.plataforma else [None])
+
+        todos_resultados = {}
+        for plat in plataformas_lista:
+            resultados_plat = buscar_fundos_supabase(
+                query_embedding=embedding,
+                plataforma=plat,
+                categoria=request.categoria,
+                tipo_produto=request.tipo_produto,
+                top_k=request.top_k,
+            )
+            for r in resultados_plat:
+                cnpj = r.get("cnpj")
+                if cnpj not in todos_resultados:
+                    todos_resultados[cnpj] = r
+
+        # Reordenar por similaridade e limitar ao top_k
+        resultados = sorted(
+            todos_resultados.values(),
+            key=lambda x: x.get("similaridade", 0),
+            reverse=True,
+        )[:request.top_k]
+
         logger.info(f"   {len(resultados)} fundos retornados pelo Supabase")
 
     except Exception as e:

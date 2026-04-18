@@ -428,15 +428,21 @@
     </div>
 
     <div id="filters-bar">
-      <select class="filter-select" id="filter-plataforma">
-        <option value="">Todas plataformas</option>
-        <option value="XP">XP</option>
-        <option value="BTG">BTG</option>
-        <option value="Inter">Inter</option>
-        <option value="Itau">Itaú</option>
-        <option value="Santander">Santander</option>
-        <option value="Bradesco">Bradesco</option>
-      </select>
+      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+        <span class="filter-label">Plataformas:</span>
+        <label style="color:#94a3b8;font-size:12px;display:flex;align-items:center;gap:3px">
+          <input type="checkbox" class="plat-check" value="XP"> XP</label>
+        <label style="color:#94a3b8;font-size:12px;display:flex;align-items:center;gap:3px">
+          <input type="checkbox" class="plat-check" value="BTG"> BTG</label>
+        <label style="color:#94a3b8;font-size:12px;display:flex;align-items:center;gap:3px">
+          <input type="checkbox" class="plat-check" value="Inter"> Inter</label>
+        <label style="color:#94a3b8;font-size:12px;display:flex;align-items:center;gap:3px">
+          <input type="checkbox" class="plat-check" value="Itau"> Itaú</label>
+        <label style="color:#94a3b8;font-size:12px;display:flex;align-items:center;gap:3px">
+          <input type="checkbox" class="plat-check" value="Santander"> Santander</label>
+        <label style="color:#94a3b8;font-size:12px;display:flex;align-items:center;gap:3px">
+          <input type="checkbox" class="plat-check" value="Bradesco"> Bradesco</label>
+      </div>
       <select class="filter-select" id="filter-categoria">
         <option value="">Todas categorias</option>
         <option value="Renda Fixa">Renda Fixa</option>
@@ -481,14 +487,48 @@
 
     const SYSTEM_PROMPT = `Você é o assessor de investimentos virtual da 3A Riva Investimentos, uma assessoria vinculada à XP Investimentos.
 
-Suas diretrizes:
-- Responda de forma clara, objetiva e profissional
-- Use os dados dos fundos fornecidos no contexto para embasar suas recomendações
-- Sempre considere as premissas e diretrizes do assessor
-- Quando não houver fundos relevantes no contexto, seja honesto sobre isso
-- Nunca invente dados sobre fundos — use apenas o que está no contexto
-- Formate valores monetários em R$ e percentuais com 2 casas decimais
-- Seja proativo em alertar sobre riscos e pontos de atenção`;
+REGRA ABSOLUTA — VOCÊ SÓ SABE O QUE ESTÁ NO CONTEXTO:
+- Você NÃO tem conhecimento próprio sobre investimentos, fundos, produtos financeiros ou mercado
+- Sua ÚNICA fonte de informação são: (1) os fundos no bloco CONTEXTO, (2) as PREMISSAS DO ASSESSOR e (3) o histórico desta conversa
+- NUNCA cite, mencione ou sugira produtos que NÃO estejam no contexto — nem mesmo para dizer "você poderia considerar também X"
+- NUNCA use conhecimento externo para corrigir, complementar ou contradizer os dados do contexto
+- NUNCA explique conceitos financeiros que não estejam nas premissas (ex: não explique o que é LCI, come-cotas, etc. por conta própria)
+- Se o cliente perguntar algo que as premissas e o contexto não cobrem, responda: "Não tenho essa informação na minha base atual. Posso consultar seu assessor para responder isso."
+- Se o contexto trouxer fundos que não são exatamente o que o cliente pediu mas são próximos, apresente-os explicando o que encontrou
+- Se o contexto NÃO trouxer fundos adequados, diga apenas: "Não encontrei fundos no nosso catálogo que atendam a esse critério." Pare aí. Não sugira alternativas fora do contexto
+
+REGRAS DE COMPORTAMENTO:
+- Responda de forma clara, objetiva e profissional, como um assessor experiente
+- Apresente APENAS dados que existam explicitamente no contexto (rentabilidade, CNPJ, taxa, PL, etc.)
+- Quando o cliente mencionar suas plataformas, filtre sua resposta pelos fundos disponíveis nessas plataformas conforme o contexto
+- Seja proativo em alertar sobre riscos usando APENAS os campos "Alertas" e "Quando NÃO indicar" do contexto
+
+REGRAS DE FORMATAÇÃO (siga rigorosamente):
+- Tom conversacional e profissional
+- CONCISO — máximo 300 palavras salvo quando o cliente pedir mais detalhes
+- NÃO use emojis
+- NÃO use headers markdown (##, ###). Use apenas negrito (**texto**) para nomes de fundos ou valores
+- NÃO use separadores (---, ===)
+- Use listas com travessão (—) apenas para 3+ itens
+- Valores monetários em R$, percentuais com 2 casas decimais
+- Termine com uma frase curta e específica sobre o que pode aprofundar
+- Em perguntas de continuação, use o histórico da conversa`;
+
+    // ── Follow-up Detection ──────────────────────────────
+    const FOLLOWUP_PATTERNS = [
+      /\b(dess?[ea]s?|est?[ea]s?|ess[ea]s?|aquel[ea]s?)\b/i,
+      /\b(anterior|acima|citad[oa]s?|mencionad[oa]s?|listad[oa]s?)\b/i,
+      /\b(mesm[oa]s?|últim[oa]s?)\s+(fund|produto|recomend)/i,
+      /\b(mais (sobre|detalhes|informaç)|aprofund|detalh[ae])\b/i,
+      /\b(compar[ae]|entre el[ea]s)\b/i,
+      /\bcnpj\b/i,
+      /\b(qual del[ea]s?|qual diss[oa]|o primeiro|o segundo|o terceiro|o melhor del[ea]s)\b/i,
+    ];
+
+    function isFollowUp(text) {
+      if (conversationHistory.length === 0) return false;
+      return FOLLOWUP_PATTERNS.some(pattern => pattern.test(text));
+    }
 
     // ── Setup ────────────────────────────────────────────
     async function handleConnect() {
@@ -547,7 +587,20 @@ Suas diretrizes:
 
       const div = document.createElement("div");
       div.className = role === "user" ? "msg-user" : "msg-assistant";
-      div.textContent = content;
+
+      if (role === "assistant") {
+        // Render basic markdown: **bold** and line breaks
+        let html = content
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+          .replace(/\n/g, "<br>");
+        div.innerHTML = html;
+      } else {
+        div.textContent = content;
+      }
+
       document.getElementById("messages").appendChild(div);
       scrollToBottom();
     }
@@ -587,6 +640,7 @@ Suas diretrizes:
       div.innerHTML = `
         <div class="debug-title">🐛 Debug — Última busca</div>
         <div class="debug-content">
+          Follow-up: ${info.follow_up ? "SIM (RAG pulada)" : "NÃO (RAG consultada)"}<br>
           Fundos encontrados: ${info.fundos_encontrados}<br>
           Filtros: ${JSON.stringify(info.filtros)}<br>
           System prompt: ~${info.system_chars} chars<br>
@@ -617,30 +671,34 @@ Suas diretrizes:
       addLoading();
 
       try {
-        // 1. Search funds via RAG API
-        const plataforma = document.getElementById("filter-plataforma").value;
-        const categoria = document.getElementById("filter-categoria").value;
-        const topK = parseInt(document.getElementById("filter-topk").value) || 5;
-
-        const ragPayload = { pergunta: text, top_k: topK };
-        if (plataforma) ragPayload.plataforma = plataforma;
-        if (categoria) ragPayload.categoria = categoria;
-
-        const ragResp = await fetch(`${RAG_API_URL}/buscar`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-Key": ragApiKey,
-          },
-          body: JSON.stringify(ragPayload),
-        });
-
         let contextoFundos = "";
         let ragData = null;
+        const followUp = isFollowUp(text);
 
-        if (ragResp.ok) {
-          ragData = await ragResp.json();
-          contextoFundos = ragData.contexto_consolidado;
+        // 1. Only search RAG if it's NOT a follow-up question
+        if (!followUp) {
+          const platChecks = document.querySelectorAll(".plat-check:checked");
+          const plataformas = Array.from(platChecks).map(c => c.value);
+          const categoria = document.getElementById("filter-categoria").value;
+          const topK = parseInt(document.getElementById("filter-topk").value) || 5;
+
+          const ragPayload = { pergunta: text, top_k: topK };
+          if (plataformas.length > 0) ragPayload.plataformas = plataformas;
+          if (categoria) ragPayload.categoria = categoria;
+
+          const ragResp = await fetch(`${RAG_API_URL}/buscar`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-API-Key": ragApiKey,
+            },
+            body: JSON.stringify(ragPayload),
+          });
+
+          if (ragResp.ok) {
+            ragData = await ragResp.json();
+            contextoFundos = ragData.contexto_consolidado;
+          }
         }
 
         // 2. Build prompt
@@ -648,9 +706,16 @@ Suas diretrizes:
           ? `${SYSTEM_PROMPT}\n\n${premissasContexto}`
           : SYSTEM_PROMPT;
 
-        const userPrompt = contextoFundos
-          ? `${contextoFundos}\n\nPergunta do cliente: ${text}`
-          : `Pergunta do cliente: ${text}`;
+        // For follow-ups, send just the question (Claude has the history)
+        // For new queries, include the RAG context
+        let userPrompt;
+        if (followUp) {
+          userPrompt = text;
+        } else if (contextoFundos) {
+          userPrompt = `${contextoFundos}\n\nPergunta do cliente: ${text}`;
+        } else {
+          userPrompt = `Pergunta do cliente: ${text}`;
+        }
 
         // Keep conversation history
         conversationHistory.push({ role: "user", content: userPrompt });
@@ -689,16 +754,17 @@ Suas diretrizes:
         addMessage("assistant", assistantText);
 
         // Debug info
-        if (debugMode && ragData) {
+        if (debugMode) {
           addDebugInfo({
-            fundos_encontrados: ragData.total_resultados,
-            fundos: ragData.fundos?.map(f => ({
+            fundos_encontrados: ragData?.total_resultados || 0,
+            fundos: ragData?.fundos?.map(f => ({
               nome: f.nome,
               similaridade: f.similaridade,
             })) || [],
-            filtros: ragData.filtros_aplicados,
+            filtros: ragData?.filtros_aplicados || {},
             system_chars: systemPrompt.length,
             user_chars: userPrompt.length,
+            follow_up: followUp,
           });
         }
 
