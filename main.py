@@ -12,6 +12,8 @@ Hospedagem recomendada: Railway, Render ou Fly.io (free tier suficiente).
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import json
 import logging
 from typing import Optional
