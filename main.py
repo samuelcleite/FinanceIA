@@ -182,8 +182,8 @@ def expandir_query(pergunta: str) -> str:
 para melhorar a busca semântica em um banco de dados de fundos de investimento.
 
 O banco contém fundos com campos como: nome, gestor, categoria, subcategoria, tipo_produto,
-indexador, benchmark, tributacao, come_cotas, quando_indicar, quando_nao_indicar,
-vantagens, desvantagens, alertas, descricao_tecnica.
+indexador, benchmark, tributacao, come_cotas, descricao_tecnica, perfil_recomendado,
+riscos_e_restricoes.
 
 Reescreva a pergunta adicionando sinônimos técnicos e termos relacionados que provavelmente
 aparecem nos documentos dos fundos. Mantenha a pergunta original e adicione os termos extras.
@@ -482,18 +482,12 @@ def formatar_fundo_contexto(fundo: dict) -> FundoContexto:
         linhas.append(f"   Público-alvo: {fundo['publico_alvo']}")
 
     # Campos qualitativos
-    if fundo.get("quando_indicar"):
-        linhas.append(f"   Quando indicar: {fundo['quando_indicar']}")
-    if fundo.get("quando_nao_indicar"):
-        linhas.append(f"   Quando NÃO indicar: {fundo['quando_nao_indicar']}")
-    if fundo.get("vantagens"):
-        linhas.append(f"   Vantagens: {fundo['vantagens']}")
-    if fundo.get("desvantagens"):
-        linhas.append(f"   Desvantagens: {fundo['desvantagens']}")
-    if fundo.get("alertas"):
-        linhas.append(f"   ⚠️ Alertas: {fundo['alertas']}")
     if fundo.get("descricao_tecnica"):
         linhas.append(f"   Descrição técnica: {fundo['descricao_tecnica']}")
+    if fundo.get("perfil_recomendado"):
+        linhas.append(f"   Perfil recomendado: {fundo['perfil_recomendado']}")
+    if fundo.get("riscos_e_restricoes"):
+        linhas.append(f"   Riscos e restrições: {fundo['riscos_e_restricoes']}")
 
     # Dados quantitativos
     rents = []
