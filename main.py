@@ -3,12 +3,14 @@ FinanceIA RAG API — API intermediária entre Base44 e Supabase/pgvector.
 
 Fluxo:
 1. Base44 envia pergunta do usuário (+ filtros opcionais)
-2. API gera embedding via OpenAI
-3. API chama função buscar_fundos no Supabase (RPC)
-4. API formata o contexto dos fundos retornados
-5. API retorna contexto formatado para o Base44 montar o prompt e chamar Claude
+2. API expande a query via Haiku
+3. API gera embedding via OpenAI
+4. API busca fundos ampla no Supabase (top_k alto)
+5. API enriquece com dados quantitativos
+6. API aplica reranking quantitativo (rentabilidade, volatilidade, PL, consistência, captação)
+7. API retorna os melhores fundos formatados para o Claude
 
-Hospedagem recomendada: Railway, Render ou Fly.io (free tier suficiente).
+Hospedagem: Railway
 """
 
 import os
@@ -16,6 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import json
 import logging
+import math
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Depends, Security
@@ -32,18 +35,32 @@ from supabase import create_client, Client
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("financeia-rag")
 
-# Variáveis de ambiente (configurar no deploy)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "dev-key-trocar-em-producao")
 
-# Modelo de embedding — mesmo usado na geração dos vetores
 EMBEDDING_MODEL = "text-embedding-3-large"
 EMBEDDING_DIMENSIONS = 1536
 
+# ── Reranking: busca semântica ampla, depois filtra por qualidade ──
+# Quantos fundos buscar do pgvector antes do reranking
+RERANK_FETCH_K = 50
+# Similaridade mínima para considerar (abaixo disso, descarta)
+RERANK_MIN_SIMILARITY = 0.25
+
+# Pesos do scoring quantitativo (somam 1.0)
+# Ordem de prioridade: Rentabilidade > Volatilidade > PL > Consistência > Captação
+RERANK_WEIGHTS = {
+    "rentabilidade": 0.35,
+    "volatilidade": 0.25,
+    "pl": 0.20,
+    "consistencia": 0.12,
+    "captacao": 0.08,
+}
+
 # ──────────────────────────────────────────────────────────────
-# Clients (inicializados no startup)
+# Clients
 # ──────────────────────────────────────────────────────────────
 
 openai_client: Optional[OpenAI] = None
@@ -56,20 +73,19 @@ supabase_client: Optional[Client] = None
 app = FastAPI(
     title="FinanceIA RAG API",
     description="API intermediária para busca semântica de fundos de investimento",
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# CORS — liberar para o domínio do Base44
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Em produção, restringir ao domínio do Base44
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ──────────────────────────────────────────────────────────────
-# Autenticação simples via API Key
+# Autenticação
 # ──────────────────────────────────────────────────────────────
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -82,7 +98,7 @@ async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
 
 
 # ──────────────────────────────────────────────────────────────
-# Startup / Shutdown
+# Startup
 # ──────────────────────────────────────────────────────────────
 
 
@@ -101,61 +117,39 @@ async def startup():
 
 
 # ──────────────────────────────────────────────────────────────
-# Schemas (Pydantic)
+# Schemas
 # ──────────────────────────────────────────────────────────────
 
 
 class BuscaRequest(BaseModel):
-    """Payload enviado pelo Base44."""
-
     pergunta: str = Field(..., description="Pergunta do usuário sobre fundos")
-    plataformas: Optional[list[str]] = Field(
-        None,
-        description="Filtrar por plataformas (ex: ['XP', 'BTG']). Aceita múltiplas.",
-    )
-    plataforma: Optional[str] = Field(
-        None,
-        description="Filtrar por plataforma única (retrocompatível). Use 'plataformas' para múltiplas.",
-    )
-    categoria: Optional[str] = Field(
-        None,
-        description="Filtrar por categoria (ex: 'Renda Fixa', 'Multimercado')",
-    )
-    tipo_produto: Optional[str] = Field(
-        None,
-        description="Filtrar por tipo de produto (ex: 'Fundos', 'Previdência')",
-    )
-    top_k: int = Field(
-        5,
-        ge=1,
-        le=20,
-        description="Número de fundos a retornar (padrão: 5)",
-    )
+    plataformas: Optional[list[str]] = Field(None, description="Filtrar por plataformas")
+    plataforma: Optional[str] = Field(None, description="Filtrar por plataforma única (retrocompatível)")
+    categoria: Optional[str] = Field(None, description="Filtrar por categoria")
+    tipo_produto: Optional[str] = Field(None, description="Filtrar por tipo de produto")
+    top_k: int = Field(5, ge=1, le=20, description="Número de fundos a retornar ao Claude")
 
 
 class FundoContexto(BaseModel):
-    """Um fundo retornado pela busca, já formatado para contexto."""
-
     cnpj: str
     nome: str
     similaridade: float
-    contexto_texto: str  # Texto formatado para incluir no prompt do Claude
-    dados_estruturados: dict  # Dados brutos para o Base44 usar se precisar
+    score_quantitativo: float = 0.0
+    score_final: float = 0.0
+    contexto_texto: str
+    dados_estruturados: dict
 
 
 class BuscaResponse(BaseModel):
-    """Resposta da API com os fundos encontrados."""
-
     pergunta_original: str
     filtros_aplicados: dict
-    total_resultados: int
+    total_candidatos: int  # quantos passaram pela busca semântica
+    total_resultados: int  # quantos foram retornados após reranking
     fundos: list[FundoContexto]
-    contexto_consolidado: str  # Texto pronto para colar no prompt do Claude
+    contexto_consolidado: str
 
 
 class Premissa(BaseModel):
-    """Uma premissa/guidance retornada pela API."""
-
     id: int
     titulo: str
     categoria: Optional[str] = None
@@ -164,11 +158,9 @@ class Premissa(BaseModel):
 
 
 class PremissasResponse(BaseModel):
-    """Resposta com todas as premissas ativas, formatadas para o prompt."""
-
     total: int
     premissas: list[Premissa]
-    contexto_premissas: str  # Texto pronto para incluir no system prompt do Claude
+    contexto_premissas: str
 
 
 # ──────────────────────────────────────────────────────────────
@@ -177,7 +169,6 @@ class PremissasResponse(BaseModel):
 
 
 def gerar_embedding(texto: str) -> list[float]:
-    """Gera embedding da pergunta usando o mesmo modelo dos fundos."""
     response = openai_client.embeddings.create(
         model=EMBEDDING_MODEL,
         input=texto,
@@ -187,12 +178,6 @@ def gerar_embedding(texto: str) -> list[float]:
 
 
 def expandir_query(pergunta: str) -> str:
-    """
-    Reescreve a pergunta do usuário para incluir termos técnicos
-    que existem nos documentos dos fundos, melhorando o retrieval.
-
-    Ex: "isento de IR" → inclui "debêntures incentivadas infraestrutura tributação isento"
-    """
     EXPANSION_PROMPT = """Você é um assistente que reescreve perguntas de clientes sobre investimentos
 para melhorar a busca semântica em um banco de dados de fundos de investimento.
 
@@ -235,7 +220,7 @@ def buscar_fundos_supabase(
     plataforma: Optional[str] = None,
     categoria: Optional[str] = None,
     tipo_produto: Optional[str] = None,
-    top_k: int = 5,
+    top_k: int = 50,
 ) -> list[dict]:
     """Chama a função RPC buscar_fundos no Supabase."""
     params = {
@@ -243,7 +228,6 @@ def buscar_fundos_supabase(
         "top_k": top_k,
     }
 
-    # Adiciona filtros apenas se fornecidos
     if plataforma:
         params["filtro_plataforma"] = plataforma
     if categoria:
@@ -257,9 +241,9 @@ def buscar_fundos_supabase(
 
 def enriquecer_com_dados_complementares(fundos: list[dict]) -> list[dict]:
     """
-    Busca dados complementares que a função buscar_fundos não retorna:
+    Busca dados complementares:
     - Plataformas disponíveis (fundo_plataformas)
-    - Rentabilidade e PL (fundo_infos_atualizadas)
+    - Rentabilidade, PL, volatilidade, meses negativos, captação (fundo_infos_atualizadas)
     - Campos extras da tabela fundos (taxa_adm, taxa_performance, publico_alvo)
     """
     if not fundos:
@@ -283,7 +267,7 @@ def enriquecer_com_dados_complementares(fundos: list[dict]) -> list[dict]:
         logger.warning(f"Erro ao buscar plataformas: {e}")
         plats_por_cnpj = {}
 
-    # 2. Buscar dados atualizados (rentabilidade, PL)
+    # 2. Buscar dados atualizados (rentabilidade, PL, volatilidade, meses negativos, captação)
     try:
         infos_result = (
             supabase_client.table("fundo_infos_atualizadas")
@@ -315,7 +299,10 @@ def enriquecer_com_dados_complementares(fundos: list[dict]) -> list[dict]:
         fundo["plataformas"] = plats_por_cnpj.get(cnpj, [])
 
         infos = infos_por_cnpj.get(cnpj, {})
-        for campo in ["retorno_12m", "retorno_24m", "retorno_36m", "retorno_inicio", "pl_atual"]:
+        for campo in [
+            "retorno_12m", "retorno_24m", "retorno_36m", "retorno_inicio",
+            "pl_atual", "vol_12m", "meses_neg_12m", "captacao_liquida_30d",
+        ]:
             if infos.get(campo) is not None:
                 fundo[campo] = infos[campo]
 
@@ -327,13 +314,140 @@ def enriquecer_com_dados_complementares(fundos: list[dict]) -> list[dict]:
     return fundos
 
 
+# ──────────────────────────────────────────────────────────────
+# Reranking quantitativo
+# ──────────────────────────────────────────────────────────────
+
+
+def normalizar_min_max(valores: list[Optional[float]], inverter: bool = False) -> list[float]:
+    """
+    Normaliza uma lista de valores para [0, 1] usando min-max.
+    Se inverter=True, valores menores recebem score maior (para volatilidade, meses negativos).
+    Valores None recebem 0.0 (penalização por falta de dados).
+    """
+    nums = [v for v in valores if v is not None]
+    if not nums or max(nums) == min(nums):
+        return [0.5 if v is not None else 0.0 for v in valores]
+
+    vmin, vmax = min(nums), max(nums)
+    resultado = []
+    for v in valores:
+        if v is None:
+            resultado.append(0.0)
+        else:
+            norm = (v - vmin) / (vmax - vmin)
+            resultado.append(1.0 - norm if inverter else norm)
+    return resultado
+
+
+def calcular_score_rentabilidade(fundo: dict) -> Optional[float]:
+    """
+    Score de rentabilidade: média ponderada de 12m (peso 3), 24m (peso 2), 36m (peso 1).
+    Prioriza performance recente.
+    """
+    r12 = fundo.get("retorno_12m")
+    r24 = fundo.get("retorno_24m")
+    r36 = fundo.get("retorno_36m")
+
+    pesos = []
+    valores = []
+    if r12 is not None:
+        valores.append(r12)
+        pesos.append(3)
+    if r24 is not None:
+        valores.append(r24)
+        pesos.append(2)
+    if r36 is not None:
+        valores.append(r36)
+        pesos.append(1)
+
+    if not valores:
+        return None
+
+    return sum(v * p for v, p in zip(valores, pesos)) / sum(pesos)
+
+
+def reranking_quantitativo(fundos: list[dict], top_k: int) -> list[dict]:
+    """
+    Aplica scoring quantitativo aos fundos já enriquecidos com dados da fundo_infos_atualizadas.
+
+    Critérios (em ordem de peso):
+    1. Rentabilidade (35%) — média ponderada 12m/24m/36m
+    2. Volatilidade baixa (25%) — invertido: menor vol = melhor score
+    3. Tamanho do fundo PL (20%) — maior PL = mais score
+    4. Consistência (12%) — meses negativos invertido: menos meses neg = melhor
+    5. Captação líquida (8%) — maior captação = mais confiança do mercado
+
+    Fundos sem dados quantitativos recebem score 0 nos critérios faltantes,
+    o que os penaliza naturalmente no ranking.
+    """
+    if not fundos:
+        return fundos
+
+    n = len(fundos)
+    logger.info(f"   📊 Reranking: {n} candidatos → top {top_k}")
+
+    # Extrair valores brutos para cada critério
+    rent_brutos = [calcular_score_rentabilidade(f) for f in fundos]
+    vol_brutos = [f.get("vol_12m") for f in fundos]
+    pl_brutos = [f.get("pl_atual") for f in fundos]
+    consist_brutos = [f.get("meses_neg_12m") for f in fundos]
+    capt_brutos = [f.get("captacao_liquida_30d") for f in fundos]
+
+    # Normalizar para [0, 1]
+    rent_norm = normalizar_min_max(rent_brutos, inverter=False)
+    vol_norm = normalizar_min_max(vol_brutos, inverter=True)       # menor vol = melhor
+    pl_norm = normalizar_min_max(pl_brutos, inverter=False)
+    consist_norm = normalizar_min_max(consist_brutos, inverter=True)  # menos meses neg = melhor
+    capt_norm = normalizar_min_max(capt_brutos, inverter=False)
+
+    # Calcular score composto para cada fundo
+    w = RERANK_WEIGHTS
+    for i, fundo in enumerate(fundos):
+        score_quant = (
+            w["rentabilidade"] * rent_norm[i]
+            + w["volatilidade"] * vol_norm[i]
+            + w["pl"] * pl_norm[i]
+            + w["consistencia"] * consist_norm[i]
+            + w["captacao"] * capt_norm[i]
+        )
+        fundo["_score_quantitativo"] = round(score_quant, 4)
+        fundo["_score_similaridade"] = fundo.get("similaridade", 0)
+
+        # Score final: 40% semântico + 60% quantitativo
+        # A semântica garante relevância temática, o quantitativo garante qualidade
+        sim_normalizado = fundo.get("similaridade", 0)
+        fundo["_score_final"] = round(0.4 * sim_normalizado + 0.6 * score_quant, 4)
+
+    # Ordenar pelo score final (maior = melhor)
+    fundos.sort(key=lambda f: f["_score_final"], reverse=True)
+
+    # Log dos top resultados para debug
+    for i, f in enumerate(fundos[:top_k]):
+        logger.info(
+            f"   #{i+1} {f.get('nome', '?')[:50]} | "
+            f"sim={f['_score_similaridade']:.4f} | "
+            f"quant={f['_score_quantitativo']:.4f} | "
+            f"final={f['_score_final']:.4f} | "
+            f"r12m={f.get('retorno_12m', 'N/A')} | "
+            f"vol={f.get('vol_12m', 'N/A')} | "
+            f"pl={f.get('pl_atual', 'N/A')}"
+        )
+
+    return fundos[:top_k]
+
+
+# ──────────────────────────────────────────────────────────────
+# Formatação
+# ──────────────────────────────────────────────────────────────
+
+
 def formatar_fundo_contexto(fundo: dict) -> FundoContexto:
     """Transforma o resultado da busca em contexto formatado para o prompt do Claude."""
 
     linhas = []
     linhas.append(f"📌 {fundo.get('nome', 'N/A')} (CNPJ: {fundo.get('cnpj', 'N/A')})")
 
-    # --- Dados estruturados (da função buscar_fundos) ---
     if fundo.get("gestor"):
         linhas.append(f"   Gestor: {fundo['gestor']}")
 
@@ -350,7 +464,6 @@ def formatar_fundo_contexto(fundo: dict) -> FundoContexto:
     if fundo.get("come_cotas"):
         linhas.append(f"   Come-cotas: {fundo['come_cotas']}")
 
-    # Taxas (campos extras enriquecidos)
     taxas = []
     if fundo.get("taxa_adm") is not None:
         taxas.append(f"Adm: {fundo['taxa_adm']}%")
@@ -368,7 +481,7 @@ def formatar_fundo_contexto(fundo: dict) -> FundoContexto:
     if fundo.get("publico_alvo"):
         linhas.append(f"   Público-alvo: {fundo['publico_alvo']}")
 
-    # --- Campos qualitativos (gerados pela IA nos pipelines) ---
+    # Campos qualitativos
     if fundo.get("quando_indicar"):
         linhas.append(f"   Quando indicar: {fundo['quando_indicar']}")
     if fundo.get("quando_nao_indicar"):
@@ -382,7 +495,7 @@ def formatar_fundo_contexto(fundo: dict) -> FundoContexto:
     if fundo.get("descricao_tecnica"):
         linhas.append(f"   Descrição técnica: {fundo['descricao_tecnica']}")
 
-    # --- Dados enriquecidos (fundo_infos_atualizadas) ---
+    # Dados quantitativos
     rents = []
     for periodo, label in [("retorno_12m", "12m"), ("retorno_24m", "24m"), ("retorno_36m", "36m")]:
         val = fundo.get(periodo)
@@ -390,10 +503,17 @@ def formatar_fundo_contexto(fundo: dict) -> FundoContexto:
             rents.append(f"{label}: {val:.2f}%")
     if rents:
         linhas.append(f"   Rentabilidade: {' | '.join(rents)}")
+
+    if fundo.get("vol_12m") is not None:
+        linhas.append(f"   Volatilidade 12m: {fundo['vol_12m']:.2f}%")
+    if fundo.get("meses_neg_12m") is not None:
+        linhas.append(f"   Meses negativos (12m): {fundo['meses_neg_12m']}")
     if fundo.get("pl_atual") is not None:
         linhas.append(f"   PL atual: R$ {fundo['pl_atual']:,.0f}")
+    if fundo.get("captacao_liquida_30d") is not None:
+        linhas.append(f"   Captação líquida 30d: R$ {fundo['captacao_liquida_30d']:,.0f}")
 
-    # --- Plataformas (fundo_plataformas) ---
+    # Plataformas
     if fundo.get("plataformas"):
         linhas.append(f"   Disponível em: {', '.join(fundo['plataformas'])}")
 
@@ -404,11 +524,13 @@ def formatar_fundo_contexto(fundo: dict) -> FundoContexto:
         cnpj=fundo.get("cnpj", ""),
         nome=fundo.get("nome", "N/A"),
         similaridade=round(similaridade, 4),
+        score_quantitativo=round(fundo.get("_score_quantitativo", 0), 4),
+        score_final=round(fundo.get("_score_final", 0), 4),
         contexto_texto=contexto_texto,
         dados_estruturados={
             k: v
             for k, v in fundo.items()
-            if k not in ("embedding", "documento_texto") and v is not None
+            if k not in ("embedding", "documento_texto") and not k.startswith("_") and v is not None
         },
     )
 
@@ -418,12 +540,11 @@ def montar_contexto_consolidado(
     pergunta: str,
     filtros: dict,
 ) -> str:
-    """Monta o bloco de contexto completo para incluir no prompt do Claude."""
-
     header = "=" * 60
     linhas = [
         header,
         "CONTEXTO: FUNDOS DE INVESTIMENTO RELEVANTES",
+        "(Ordenados por relevância semântica + qualidade quantitativa)",
         header,
         f"Pergunta do cliente: {pergunta}",
     ]
@@ -432,11 +553,11 @@ def montar_contexto_consolidado(
     if filtros_ativos:
         linhas.append(f"Filtros aplicados: {json.dumps(filtros_ativos, ensure_ascii=False)}")
 
-    linhas.append(f"Total de fundos encontrados: {len(fundos_formatados)}")
+    linhas.append(f"Total de fundos selecionados: {len(fundos_formatados)}")
     linhas.append(header)
 
     for i, fundo in enumerate(fundos_formatados, 1):
-        linhas.append(f"\n--- Fundo {i}/{len(fundos_formatados)} (similaridade: {fundo.similaridade:.4f}) ---")
+        linhas.append(f"\n--- Fundo {i}/{len(fundos_formatados)} (relevância: {fundo.score_final:.2f}) ---")
         linhas.append(fundo.contexto_texto)
 
     linhas.append(f"\n{header}")
@@ -453,12 +574,14 @@ def montar_contexto_consolidado(
 
 @app.get("/health")
 async def health_check():
-    """Verificação de saúde da API."""
     return {
         "status": "ok",
         "service": "financeia-rag-api",
+        "version": "2.0.0",
         "embedding_model": EMBEDDING_MODEL,
         "embedding_dimensions": EMBEDDING_DIMENSIONS,
+        "rerank_fetch_k": RERANK_FETCH_K,
+        "rerank_weights": RERANK_WEIGHTS,
     }
 
 
@@ -468,22 +591,28 @@ async def buscar_fundos(
     _api_key: str = Depends(verify_api_key),
 ):
     """
-    Endpoint principal: recebe pergunta, busca fundos relevantes,
-    retorna contexto formatado para o Base44 montar o prompt do Claude.
+    Endpoint principal com reranking quantitativo.
 
     Fluxo:
-    1. Gera embedding da pergunta
-    2. Chama buscar_fundos no Supabase (busca vetorial + filtros)
-    3. Formata cada fundo como contexto legível
-    4. Retorna contexto consolidado pronto para prompt
+    1. Expande a query (Haiku)
+    2. Gera embedding (OpenAI)
+    3. Busca semântica ampla (top 50 do pgvector)
+    4. Filtra por similaridade mínima
+    5. Enriquece com dados quantitativos
+    6. Reranking: 40% semântico + 60% quantitativo
+    7. Retorna top_k melhores formatados
     """
-    logger.info(f"🔍 Busca: '{request.pergunta}' | plataforma={request.plataforma} | plataformas={request.plataformas} | categoria={request.categoria}")
+    logger.info(
+        f"🔍 Busca: '{request.pergunta}' | plataforma={request.plataforma} | "
+        f"plataformas={request.plataformas} | categoria={request.categoria} | "
+        f"top_k_final={request.top_k}"
+    )
 
     try:
-        # 1. Expandir a query para melhorar o retrieval
+        # 1. Expandir a query
         query_expandida = expandir_query(request.pergunta)
 
-        # 2. Gerar embedding da query expandida
+        # 2. Gerar embedding
         embedding = gerar_embedding(query_expandida)
         logger.info(f"   Embedding gerado ({len(embedding)} dimensões)")
 
@@ -492,7 +621,7 @@ async def buscar_fundos(
         raise HTTPException(status_code=502, detail=f"Erro ao gerar embedding: {str(e)}")
 
     try:
-        # 3. Buscar fundos — se múltiplas plataformas, faz uma busca por plataforma e merge
+        # 3. Busca semântica ampla — pega RERANK_FETCH_K fundos
         plataformas_lista = request.plataformas or ([request.plataforma] if request.plataforma else [None])
 
         todos_resultados = {}
@@ -502,35 +631,43 @@ async def buscar_fundos(
                 plataforma=plat,
                 categoria=request.categoria,
                 tipo_produto=request.tipo_produto,
-                top_k=request.top_k,
+                top_k=RERANK_FETCH_K,
             )
             for r in resultados_plat:
                 cnpj = r.get("cnpj")
                 if cnpj not in todos_resultados:
                     todos_resultados[cnpj] = r
 
-        # Reordenar por similaridade e limitar ao top_k
-        resultados = sorted(
-            todos_resultados.values(),
-            key=lambda x: x.get("similaridade", 0),
-            reverse=True,
-        )[:request.top_k]
+        # 4. Filtrar por similaridade mínima
+        candidatos = [
+            f for f in todos_resultados.values()
+            if f.get("similaridade", 0) >= RERANK_MIN_SIMILARITY
+        ]
 
-        logger.info(f"   {len(resultados)} fundos retornados pelo Supabase")
+        # Ordenar por similaridade para log
+        candidatos.sort(key=lambda x: x.get("similaridade", 0), reverse=True)
+
+        logger.info(
+            f"   {len(todos_resultados)} fundos do pgvector → "
+            f"{len(candidatos)} acima do threshold ({RERANK_MIN_SIMILARITY})"
+        )
 
     except Exception as e:
         logger.error(f"   ❌ Erro na busca Supabase: {e}")
         raise HTTPException(status_code=502, detail=f"Erro na busca vetorial: {str(e)}")
 
-    # 3. Enriquecer com dados complementares (plataformas, rentabilidade, taxas)
-    resultados = enriquecer_com_dados_complementares(resultados)
+    # 5. Enriquecer com dados quantitativos
+    candidatos = enriquecer_com_dados_complementares(candidatos)
 
-    # 4. Formatar cada fundo
-    fundos_formatados = [formatar_fundo_contexto(f) for f in resultados]
+    # 6. Reranking quantitativo → retorna top_k
+    melhores = reranking_quantitativo(candidatos, request.top_k)
 
-    # 5. Montar contexto consolidado
+    # 7. Formatar
+    fundos_formatados = [formatar_fundo_contexto(f) for f in melhores]
+
     filtros = {
         "plataforma": request.plataforma,
+        "plataformas": request.plataformas,
         "categoria": request.categoria,
         "tipo_produto": request.tipo_produto,
     }
@@ -540,6 +677,7 @@ async def buscar_fundos(
     return BuscaResponse(
         pergunta_original=request.pergunta,
         filtros_aplicados=filtros,
+        total_candidatos=len(candidatos),
         total_resultados=len(fundos_formatados),
         fundos=fundos_formatados,
         contexto_consolidado=contexto,
@@ -551,26 +689,15 @@ async def contexto_completo(
     request: BuscaRequest,
     _api_key: str = Depends(verify_api_key),
 ):
-    """
-    Endpoint simplificado: retorna APENAS o contexto consolidado como texto.
-    Útil se o Base44 só precisa do texto para colar no prompt do Claude,
-    sem processar os dados estruturados.
-    """
     resultado = await buscar_fundos(request, _api_key)
     return {"contexto": resultado.contexto_consolidado}
 
 
 @app.get("/stats")
 async def stats(_api_key: str = Depends(verify_api_key)):
-    """Estatísticas básicas do catálogo."""
     try:
-        # Total de fundos
         total = supabase_client.table("fundos").select("cnpj", count="exact").execute()
-
-        # Total de embeddings
         embeddings = supabase_client.table("fundo_embeddings").select("cnpj", count="exact").execute()
-
-        # Plataformas disponíveis
         plataformas = (
             supabase_client.table("fundo_plataformas")
             .select("plataforma")
@@ -584,6 +711,9 @@ async def stats(_api_key: str = Depends(verify_api_key)):
             "plataformas": sorted(plats_unicas),
             "embedding_model": EMBEDDING_MODEL,
             "embedding_dimensions": EMBEDDING_DIMENSIONS,
+            "rerank_fetch_k": RERANK_FETCH_K,
+            "rerank_min_similarity": RERANK_MIN_SIMILARITY,
+            "rerank_weights": RERANK_WEIGHTS,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -594,16 +724,6 @@ async def listar_premissas(
     categoria: Optional[str] = None,
     _api_key: str = Depends(verify_api_key),
 ):
-    """
-    Retorna todas as premissas ativas, formatadas para incluir no system prompt.
-
-    Uso pelo Base44:
-    1. Chamar GET /premissas ao iniciar o chat (ou cachear por sessão)
-    2. Incluir o campo 'contexto_premissas' no system prompt do Claude
-    3. As premissas orientam TODAS as respostas do Claude
-
-    Filtro opcional por categoria: macro, planejamento, alocacao, alertas, regras
-    """
     try:
         query = (
             supabase_client.table("premissas")
@@ -649,12 +769,6 @@ async def atualizar_premissa(
     dados: dict,
     _api_key: str = Depends(verify_api_key),
 ):
-    """
-    Atualiza uma premissa existente.
-    Útil para o Base44 ter uma tela admin onde você edita premissas.
-
-    Campos aceitos: titulo, categoria, conteudo, ativo
-    """
     campos_permitidos = {"titulo", "categoria", "conteudo", "ativo"}
     update_data = {k: v for k, v in dados.items() if k in campos_permitidos}
 
@@ -679,10 +793,6 @@ async def atualizar_premissa(
 
 
 def formatar_premissas_para_prompt(premissas: list[Premissa]) -> str:
-    """
-    Formata todas as premissas ativas em um bloco de texto
-    pronto para incluir no system prompt do Claude.
-    """
     if not premissas:
         return ""
 
@@ -693,13 +803,11 @@ def formatar_premissas_para_prompt(premissas: list[Premissa]) -> str:
         "=" * 60,
     ]
 
-    # Agrupa por categoria para organização
     por_categoria = {}
     for p in premissas:
         cat = p.categoria or "geral"
         por_categoria.setdefault(cat, []).append(p)
 
-    # Ordem de exibição das categorias
     ordem = ["macro", "planejamento", "alocacao", "regras", "alertas", "geral"]
     categorias_ordenadas = sorted(
         por_categoria.keys(),
